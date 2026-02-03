@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Export TF_IN_AUTOMATION to indicate automated environment
+export TF_IN_AUTOMATION=1
+
 # Default cache directory
 CACHE_DIR="${1:-$HOME/.terraform.d/plugin-cache}"
 

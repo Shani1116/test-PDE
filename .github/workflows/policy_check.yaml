@@ -1,6 +1,10 @@
 name: Terraform OPA Policy Check
 
 on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
     paths:
@@ -14,6 +18,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore cached Terraform lock files
+        id: cache-terraform-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            **/.terraform.lock.hcl
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -32,6 +44,20 @@ jobs:
       - name: Set up plugin cache config
         run: |
           bash scripts/auto_test/cache_setup.sh
+
+      - name: Initialize Terraform providers
+        run: |
+          mkdir -p .terraform-init
+          cat > .terraform-init/main.tf << 'EOF'
+          terraform {
+            required_providers {
+              google = { source = "hashicorp/google", version = "~> 5.0" }
+              google-beta = { source = "hashicorp/google-beta", version = "~> 5.0" }
+            }
+          }
+          EOF
+          cd .terraform-init
+          terraform init -backend=false
  
       - name: Run policy checks (Terraform + OPA)
         run: |
@@ -39,3 +65,14 @@ jobs:
             --inputs inputs/gcp \
             --policies policies/gcp
             --verbose
+
+      - name: Save Terraform lock files
+        id: cache-terraform-save
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            **/.terraform.lock.hcl
+          key: ${{ steps.cache-terraform-restore.outputs.cache-primary-key }}
+          restore-keys: |
+            Linux-terraform-

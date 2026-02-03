@@ -5,7 +5,11 @@ import argparse
 import json
 import re
 import shutil
+import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from collections import defaultdict
 
 
 def normalize_policies_root(provided_root: Path) -> Path:
@@ -57,24 +61,36 @@ def make_success(attribute: str, service: str, resource: str) -> dict:
 def opa_eval_value(policies_root: Path, plan_json_path: Path, query: str):
     """Evaluate an OPA query and return the expression value from JSON output or None."""
     cmd = f'opa eval --data "{policies_root}" --input "{plan_json_path}" --format json "{query}"'
+    
+    start_time = time.time()
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    duration = time.time() - start_time
+    record_timing("opa_eval", duration)
+    
     if result.returncode != 0:
-        print(f"OPA eval failed: {query}")
-        print(result.stdout)
-        print(result.stderr)
+        thread_safe_print(f"❌ OPA eval failed for query: {query}")
+        thread_safe_print(f"Command: {cmd}")
+        if result.stdout:
+            thread_safe_print(f"STDOUT: {result.stdout[:500]}")
+        if result.stderr:
+            thread_safe_print(f"STDERR: {result.stderr[:500]}")
         return None
     try:
         payload = json.loads(result.stdout)
         res = payload.get("result")
         if not res:
+            thread_safe_print(f"OPA query returned empty result for: {query}")
             return None
         # Take first expression value
         exprs = res[0].get("expressions") if isinstance(res, list) and res else None
         if not exprs:
+            thread_safe_print(f"OPA query returned no expressions for: {query}")
             return None
         return exprs[0].get("value")
     except Exception as e:
-        print(f"Failed to parse OPA JSON output: {e}")
+        thread_safe_print(f"❌ Failed to parse OPA JSON output: {e}")
+        thread_safe_print(f"Query: {query}")
+        thread_safe_print(f"Output: {result.stdout[:500]}")
         return None
 
 
@@ -98,6 +114,23 @@ def get_unique_resource_names(plan_json_path: Path, resource_type: str) -> set[s
                 names.add(name)
 
     return names
+
+
+def get_all_resource_types(plan_json_path: Path) -> list[str]:
+    """Return all unique resource types found in the plan.json file."""
+    try:
+        data = json.loads(plan_json_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return []
+    
+    resource_types = set()
+    root = data.get("planned_values", {}).get("root_module", {})
+    for res in root.get("resources", []):
+        res_type = res.get("type")
+        if res_type:
+            resource_types.add(res_type)
+    
+    return sorted(resource_types)
 
 
 def parse_rego_metadata(policy_dir: Path):
@@ -181,12 +214,14 @@ def run_terraform_commands(input_dir: Path, verbose: bool = False) -> Path | Non
     })
 
     commands = [
-        ("terraform init -backend=false"),
-        ("terraform plan -refresh=false -lock=false -input=false -out=plan"),
-        ("terraform show -json plan | cat > plan.json")
+        ("env", "print_env"),
+        ("terraform init -backend=false -input=false", "terraform_init"),
+        ("terraform plan -refresh=false -lock=false -input=false -no-color -out=plan.tfplan", "terraform_plan"),
+        ("terraform show -json plan.tfplan > plan.json", "terraform_show")
     ]
 
-    for cmd in commands:
+    for cmd, operation_name in commands:
+        start_time = time.time()
         result = subprocess.run(
             cmd,
             shell=True,
@@ -195,6 +230,9 @@ def run_terraform_commands(input_dir: Path, verbose: bool = False) -> Path | Non
             text=True,
             env=env
         )
+        duration = time.time() - start_time
+        record_timing(operation_name, duration)
+        
         if result.returncode != 0:
             if verbose:
                 print(f"❌ Command failed: {cmd}")
@@ -221,12 +259,23 @@ def get_policy_metadata(policy_dir: Path, service: str, resource: str, attribute
     return message_query, vars_resource_type_query
 
 
-def log_messages(verbose: bool, message_query: str, messages: list[str]) -> None:
-    if not verbose:
-        return
-    print(f"OPA check: {message_query}")
-    for m in messages:
-        print(m)
+# Add a lock for thread-safe printing
+print_lock = Lock()
+
+def thread_safe_print(*args, **kwargs):
+    """Thread-safe print function."""
+    with print_lock:
+        print(*args, **kwargs)
+
+
+# Global timing statistics
+timing_stats = defaultdict(list)
+timing_lock = Lock()
+
+def record_timing(operation: str, duration: float):
+    """Record timing for an operation in a thread-safe manner."""
+    with timing_lock:
+        timing_stats[operation].append(duration)
 
 
 def validate_policy_output(attribute: str, resource_type: str | None, plan_path: Path, messages: list[str],
@@ -238,7 +287,7 @@ def validate_policy_output(attribute: str, resource_type: str | None, plan_path:
     nc_pattern = re.compile(r"^nc\d*$", re.IGNORECASE)
     non_nc_in_output = {n.strip() for n in matched if not nc_pattern.fullmatch(n)}
     if non_nc_in_output:
-        print(f"Check failed: Resources in output other than 'nc' found: {', '.join(sorted(non_nc_in_output))}\n")
+        thread_safe_print(f"Check failed: Resources in output other than 'nc' found: {', '.join(sorted(non_nc_in_output))}\n")
         return make_failure(attribute,
                             f"Resources in output other than 'nc' found: {', '.join(sorted(non_nc_in_output))}",
                             service, resource)
@@ -250,22 +299,22 @@ def validate_policy_output(attribute: str, resource_type: str | None, plan_path:
 
     if verbose:
         rt = resource_type if resource_type else "any"
-        print(f"Unique resource names in plan ({rt}): {len(unique_names)}")
-        print(f"Names mentioned in output: {len(matched)}")
+        thread_safe_print(f"Unique resource names in plan ({rt}): {len(unique_names)}")
+        thread_safe_print(f"Names mentioned in output: {len(matched)}")
         if missing:
-            print(f" Missing mentions: {', '.join(sorted(missing))}")
+            thread_safe_print(f" Missing mentions: {', '.join(sorted(missing))}")
 
     if missing_non_c:
         if verbose:
-            print(f"Check failed: Unmentioned resources other than 'c' found: {', '.join(sorted(missing_non_c))}\n")
+            thread_safe_print(f"Check failed: Unmentioned resources other than 'c' found: {', '.join(sorted(missing_non_c))}\n")
         return make_failure(attribute,
                             f"Unmentioned resources other than 'c' found: {', '.join(sorted(missing_non_c))}", service,
                             resource)
 
     if missing and missing == {"c"} and verbose:
-        print("Only compliant resources are unmentioned; ignoring")
+        thread_safe_print("Only compliant resources are unmentioned; ignoring")
     if verbose:
-        print("Check passed\n")
+        thread_safe_print("Check passed\n")
     return make_success(attribute, service, resource)
 
 
@@ -285,7 +334,15 @@ def run_policy_check_pair(input_dir: Path, policy_dir: Path, policies_root: Path
 
     resource_type = get_resource_type(policies_root, plan_path, vars_resource_type_query)
     if resource_type is None:
-        res = make_failure(attribute, "Could not find any resources!", service, resource)
+        # Get diagnostic info
+        actual_types = get_all_resource_types(plan_path)
+        diagnostics = [
+            f"Query used: {vars_resource_type_query}",
+            f"Resource types found in plan: {', '.join(actual_types) if actual_types else 'NONE'}",
+            f"Plan file: {plan_path}"
+        ]
+        error_msg = "Could not find resource_type variable! " + " | ".join(diagnostics)
+        res = make_failure(attribute, error_msg, service, resource)
         return res
 
     messages = get_policy_messages(policies_root, plan_path, message_query)
@@ -293,7 +350,11 @@ def run_policy_check_pair(input_dir: Path, policy_dir: Path, policies_root: Path
         res = make_failure(attribute, "Could not run OPA query!", service, resource)
         return res
 
-    log_messages(verbose, message_query, messages)
+    if verbose:
+        thread_safe_print(f"OPA check: {message_query}")
+        for m in messages:
+            thread_safe_print(m)
+    
     res = validate_policy_output(attribute, resource_type, plan_path, messages, verbose, service, resource)
     return res
 
@@ -352,6 +413,7 @@ def main():
     parser.add_argument("--inputs", default="inputs/gcp", help="Root directory for Terraform inputs")
     parser.add_argument("--policies", default="policies/gcp", help="Root directory for policy files")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers (default: 4)")
     args = parser.parse_args()
 
     inputs_root = Path(args.inputs)
@@ -365,9 +427,25 @@ def main():
 
     results = []
     failure_flag = False
-    for input_dir, policy_dir in pairs:
-        result = run_policy_check_pair(input_dir, policy_dir, policies_base_root, verbose=args.verbose)
-        results.append(result)
+    
+    # Process pairs in parallel
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        # Submit all tasks
+        future_to_pair = {
+            executor.submit(run_policy_check_pair, input_dir, policy_dir, policies_base_root, args.verbose): (input_dir, policy_dir)
+            for input_dir, policy_dir in pairs
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_pair):
+            input_dir, policy_dir = future_to_pair[future]
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as exc:
+                thread_safe_print(f"Error processing {input_dir}: {exc}")
+                service, resource, attribute = extract_path_parts(input_dir)
+                results.append(make_failure(attribute, f"Exception: {exc}", service, resource))
 
     # Grouped summary by service -> resource
     grouped: dict[str, dict[str, list[dict]]] = {}
@@ -395,6 +473,28 @@ def main():
                         print(f"Service: {service} | Resource: {resource} | Policy: {res['policy']}")
                         print(f"{res['failure']['reason']}")
                         print()
+        
+    # Print timing statistics
+    print("\n" + "="*60)
+    print("TIMING STATISTICS")
+    print("="*60)
+    for operation in sorted(timing_stats.keys()):
+        timings = timing_stats[operation]
+        if timings:
+            total = sum(timings)
+            avg = total / len(timings)
+            min_time = min(timings)
+            max_time = max(timings)
+            print(f"\n{operation}:")
+            print(f"  Total time: {total:.2f}s")
+            print(f"  Calls: {len(timings)}")
+            print(f"  Average: {avg:.2f}s")
+            print(f"  Min: {min_time:.2f}s")
+            print(f"  Max: {max_time:.2f}s")
+    
+    print("\n" + "="*60)
+    
+    if failure_flag:
         sys.exit(1)
 
 
